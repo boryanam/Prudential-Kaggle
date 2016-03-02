@@ -1,0 +1,197 @@
+---
+title: "Prudential-xgb"
+author: "Boryana Manz"
+date: "March 1, 2016"
+output: html_document
+---
+Prudential data set 
+
+```{r, warning=FALSE}
+library(xgboost)
+library(caret)
+library(readr)
+library(dplyr)
+library(data.table)
+
+#read in data
+train <- read_csv("train.csv")
+Test  <- read_csv("test.csv")
+str(train)
+```
+
+Combine Train and Test sets for generation of factors
+
+```{r}
+#remove Response from Train
+train.full.Response = train$Response
+train[,"Response"] = NULL
+
+train.size = dim(train)   
+test.size = dim(Test) 
+All = rbind(train, Test)
+
+# set NA 
+All[is.na(All)] = -999
+
+All.ID = All$Id
+All[["Id"]] = NULL
+```
+Factorize categorical variables
+```{r}
+categ = names(train)
+continuous = scan(text = "Product_Info_4, Ins_Age, Ht, Wt, BMI, Employment_Info_1, Employment_Info_4, Employment_Info_6, Insurance_History_5, Family_Hist_2, Family_Hist_3, Family_Hist_4, Family_Hist_5",
+                  sep = ",", what = "character", strip.white = TRUE)
+for (i in c(continuous, "Id")) { categ = categ[-which(categ == i)]}
+
+factorize = function(dataset, columns) {
+  for (i in columns) { dataset[[i]] = as.factor(dataset[[i]])}
+  return(dataset)
+}
+
+All = factorize(All, categ)
+All  = data.table(All)
+
+```
+Create new variables
+```{r}
+All[, BMIt := (All[,Wt]/(All[,Ht]^2))]
+All[, BMItsq := (All[,Wt]/(All[,Ht]^2))^2]
+All[, BMItlg := 2.72 + log(All[,Wt]/(All[,Ht]^2))]
+#ADD SOME for PI4
+
+```
+Split back to train and Test. Split train to train/validation/test  = 60/20/20%
+```{r}
+train = All[1:train.size[1],]
+Test = All[(train.size[1]+1):dim(All)[1],]
+
+train.ID = All.ID[1:train.size[1]]
+Test.ID = All.ID[train.size[1]+1:length(All.ID)]
+
+split1 = createDataPartition(train.full.Response, times = 1, p = 0.6, list = FALSE)
+train1 = train[as.vector(split1),]
+train.Response = train.full.Response[as.vector(split1)]
+combo = train[-as.vector(split1),]
+combo.response = train.full.Response[-as.vector(split1)]
+split2 = createDataPartition(combo.response, times = 1, p = 0.5, list = FALSE)
+test = combo[as.vector(split2),]
+test.response = combo.response[as.vector(split2)]
+val = combo[-as.vector(split2),]
+val.response = combo.response[-as.vector(split2)]
+train = train1
+
+```
+
+XGB optimization - Learning rate with initial parameters - train and cv error converge to mlogloss ~ 1.2, which is high. The model has too much bias.  
+```{r}
+train.xgb = xgb.DMatrix(data.matrix(train), label = (train.Response))
+param.m = list(max.depth = 4, 
+               eta = 0.5, nthread = 4,
+               objective = "multi:softmax", num_class = 9, eval_metric = "mlogloss", 
+               missing = 'NAN', alpha = 0.5, lambda = 1)
+
+learn.plot.xgb.all = function(train, interval, param.m, nround) {
+  sample.n = seq(100, dim(train)[1], interval)
+  train_error = c()
+  cv_error = c()
+  for (i in 1:length(sample.n)) {  
+    S = sample(1:dim(train)[1], sample.n[i], replace = FALSE)    
+    train.xgb = xgb.DMatrix(data.matrix(train[S,]), label = (train.Response[S]))
+    res = xgb.cv(data = train.xgb, params = param.m, nrounds = nround, nfold = 5)
+    train_error[i] = res[[1]][[nround]]
+    cv_error[i] = res[[3]][[nround]]
+  }  
+  plot(sample.n, train_error, ylim = range(c(train_error,cv_error)), ylab = "Accuracy")
+  #plot(train_error, ylim = range(c(train_error,cv_error)), ylab = "Accuracy")
+  lines(sample.n, cv_error)
+  #lines(cv_error)
+  #return(train_error)
+}  
+learn.plot.xgb.all(train, 10000,param.m, 10) 
+```
+Grid search to find better parameters.
+```{r}
+xgb.eval = function(train.xgb, nrounds.g, nfold.g = 5, max.depth.g = 6, eta.g = 0.5, alpha.g = 0.1, lambda.g = 1) {
+  param.m = list(max.depth = max.depth.g, 
+                 eta = eta.g, nthread = 4,
+                 objective = "multi:softmax", num_class = 9, eval_metric = "mlogloss", 
+                 missing = 'NAN', alpha = alpha.g, lambda = lambda.g)
+  res = xgb.cv(data = train.xgb, params = param.m, nrounds = nrounds.g, nfold = nfold.g)
+  param.m['trainerror'] = res[dim(res)[1]][[1]]
+  param.m['cverror'] = res[dim(res)[1]][[3]]
+  return(param.m)
+  }
+
+#grid search
+xgb.grid = function(train.xgb,
+                    max.depth.g =seq(8:9), #seq(3,7)
+                    eta.g = seq(0.1,0.9,0.25),
+                    alpha.g = 0.5,
+                    lambda.g = seq(0, 1, 0.25),
+                    nrounds.g = 2,
+                    nfold.g = 3) {
+  results = list()
+  for(md in max.depth.g) {
+    for (eg in eta.g) {
+      for (ag in alpha.g) {
+        for (lg in lambda.g) {
+          temp = xgb.eval(train.xgb, 
+                          nrounds.g, 
+                          nfold.g, 
+                          max.depth.g = md, 
+                          eta.g = eg, 
+                          alpha.g = ag, 
+                          lambda.g = lg) 
+          results = c(results, temp)
+        }
+      }
+    }
+  }
+  results_df = data.frame(matrix((results), nrow=11, byrow=F))
+  row.names(results_df) = c('max.depth', 'eta', 'nthread', 'objective', 'num_class', 'eval_metric', 'missing', 'alpha', 'lambda', 'train.err', 'cv.err')
+  plot(unlist(results_df['cv.err',]))
+}
+
+xgb.grid(train.xgb,
+                    max.depth.g =seq(3,7),
+                    eta.g = 0.5,
+                    alpha.g = seq(0,1,0.25),
+                    lambda.g = seq(0, 1, 0.25),
+                    nrounds.g = 5,
+                    nfold.g = 3)
+
+```
+Second grid - even higher max.depth and optimizing learning rate.
+```{r}
+xgb.grid(train.xgb,
+                    max.depth.g =seq(8,10),
+                    eta.g = seq(0.1,0.9,0.25),
+                    alpha.g = 0,
+                    lambda.g = 1,
+                    nrounds.g = 5,
+                    nfold.g = 3)
+
+```
+
+Model with optimized parameters
+```{r}
+param.m.best = list(max.depth = 9, 
+               eta = 1, nthread = 4,
+               objective = "multi:softmax", num_class = 9, eval_metric = "mlogloss", 
+               missing = 'NAN', alpha = 0, lambda = 1)
+
+
+bst = xgboost(data = train.xgb, params = param.m.best, nrounds = 20)
+
+```
+
+Predictions
+```{r}
+T.pred <- as.integer(round(predict(bst, newdata = data.matrix(Test), missing = 'NAN')))
+T.pred[T.pred<1] <- 1
+T.pred[T.pred>8] <- 8
+results = data.frame(Id = Test.ID, Response = T.pred)
+names(results) = c("Id", "Response")
+write.csv(results, file = "sub-030116.csv", quote = TRUE, sep = "," , dec ="." ,
+          row.names = FALSE, col.names = TRUE)
+```
