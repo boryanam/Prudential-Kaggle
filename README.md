@@ -7,3 +7,5 @@ The .rmd details some of the approaces for analysis.
 * feature engineering (new BMI and Age interactions) 
 * using learning curve to reveal bias 
 * grid search to optimize parameters to minimize mlogloss
+
+Visual analysis of the data in ManzPlot repository.
